@@ -1,0 +1,7 @@
+{
+  "name": "Gemini English Tutor",
+  "description": "An interactive English tutor powered by Gemini. Practice your speaking skills and get real-time feedback on your grammar and expression. All your feedback is saved for you to review anytime.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
