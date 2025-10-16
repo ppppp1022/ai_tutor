@@ -1,14 +1,17 @@
-
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { LiveServerMessage, LiveConnectSession, Blob } from '@google/genai';
-import { ConversationTurn, FeedbackItem } from '../types';
-import { connectLive, getFeedbackForText, encode, decode, decodeAudioData } from '../services/geminiService';
+import { ConversationTurn, FeedbackItem, Settings, SessionRecord } from '../types';
+import { connectLive, getFeedbackForText, encode, decode, decodeAudioData, getSummaryForConversation } from '../services/geminiService';
 
-export const useTutor = (addFeedback: (item: FeedbackItem) => void) => {
+export const useTutor = (
+    saveSession: (session: SessionRecord) => void,
+    settings: Settings
+) => {
   const [isSessionActive, setIsSessionActive] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [conversation, setConversation] = useState<ConversationTurn[]>([]);
   const [latestFeedback, setLatestFeedback] = useState<FeedbackItem | null>(null);
+  const [combo, setCombo] = useState(0);
 
   const sessionPromiseRef = useRef<Promise<LiveConnectSession> | null>(null);
   const inputAudioContextRef = useRef<AudioContext | null>(null);
@@ -16,7 +19,8 @@ export const useTutor = (addFeedback: (item: FeedbackItem) => void) => {
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const mediaStreamSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-
+  
+  const sessionFeedbackItemsRef = useRef<FeedbackItem[]>([]);
   const currentInputTranscriptionRef = useRef('');
   const currentOutputTranscriptionRef = useRef('');
   
@@ -52,16 +56,17 @@ export const useTutor = (addFeedback: (item: FeedbackItem) => void) => {
       currentOutputTranscriptionRef.current = '';
       
       if(userText) {
+          setCombo(prev => prev + 1);
           setIsProcessing(true);
-          const feedback = await getFeedbackForText(userText);
+          const feedback = await getFeedbackForText(userText, settings.language);
           if (feedback) {
               const newFeedbackItem: FeedbackItem = {
                   ...feedback,
-                  id: new Date().toISOString(),
+                  id: new Date().toISOString() + Math.random(),
                   timestamp: new Date().toLocaleString(),
               };
               setLatestFeedback(newFeedbackItem);
-              addFeedback(newFeedbackItem);
+              sessionFeedbackItemsRef.current.push(newFeedbackItem);
           }
           setIsProcessing(false);
       }
@@ -87,13 +92,85 @@ export const useTutor = (addFeedback: (item: FeedbackItem) => void) => {
       audioSourcesRef.current.clear();
       nextStartTime = 0;
     }
-  }, [addFeedback]);
+  }, [settings.language]);
 
-  const startSession = useCallback(async () => {
+  const stopSession = useCallback(async () => {
+    const sessionToClose = sessionPromiseRef.current;
+    const conversationToSave = [...conversation];
+    const feedbackToSave = [...sessionFeedbackItemsRef.current];
+    const maxCombo = combo;
+    const sessionId = new Date().toISOString();
+
+    setConversation([]);
+    setLatestFeedback(null);
+    setCombo(0);
+    sessionFeedbackItemsRef.current = [];
+
+    sessionToClose?.then(session => session.close());
+    sessionPromiseRef.current = null;
+    
+    mediaStreamRef.current?.getTracks().forEach(track => track.stop());
+    mediaStreamRef.current = null;
+    
+    scriptProcessorRef.current?.disconnect();
+    scriptProcessorRef.current = null;
+    mediaStreamSourceRef.current?.disconnect();
+    mediaStreamSourceRef.current = null;
+    
+    inputAudioContextRef.current?.close();
+    inputAudioContextRef.current = null;
+    outputAudioContextRef.current?.close();
+    outputAudioContextRef.current = null;
+
+    for (const source of audioSourcesRef.current.values()) {
+        source.stop();
+    }
+    audioSourcesRef.current.clear();
+    
+    setIsSessionActive(false);
+
+    if (conversationToSave.length > 0) {
+      const summary = await getSummaryForConversation(conversationToSave);
+      const newSession: SessionRecord = {
+        id: sessionId,
+        date: sessionId.split('T')[0],
+        summary,
+        maxCombo,
+        conversation: conversationToSave,
+        feedbackItems: feedbackToSave,
+      };
+      saveSession(newSession);
+    }
+  }, [conversation, combo, saveSession]);
+
+  const startSession = useCallback(async (topic?: string) => {
     try {
       setConversation([]);
       setLatestFeedback(null);
+      setCombo(0);
+      sessionFeedbackItemsRef.current = [];
       
+      let speedInstruction = '';
+      if (settings.speed === 'slightly_slower') {
+          speedInstruction = 'Please speak slightly slower than a normal conversational pace.';
+      } else if (settings.speed === 'slower') {
+          speedInstruction = 'Please speak clearly and very slowly.';
+      }
+
+      let profileInstruction = '';
+      if (settings.name || settings.age || settings.description) {
+        profileInstruction = `You are talking to ${settings.name || 'a student'}${settings.age ? `, who is ${settings.age} years old` : ''}. ${settings.description ? `Their interests include: ${settings.description}.` : ''} Use this information to make the conversation more personal.`;
+      }
+      
+      let topicInstruction = '';
+      if (topic && topic.trim()) {
+        topicInstruction = `Start the conversation by asking the user about "${topic}".`;
+      } else {
+        topicInstruction = 'Start the conversation by suggesting a topic to discuss, for example, "hobbies", "weekend plans", or "favorite food".';
+      }
+
+      const systemInstruction = `You are a friendly and encouraging English tutor. Keep your responses concise and natural, as if in a real conversation. Your goal is to help the user practice speaking. ${speedInstruction} ${profileInstruction} ${topicInstruction}`;
+
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaStreamRef.current = stream;
 
@@ -127,39 +204,14 @@ export const useTutor = (addFeedback: (item: FeedbackItem) => void) => {
         onmessage: handleMessage,
         onerror: (e: ErrorEvent) => { console.error('Session error:', e); stopSession(); },
         onclose: (e: CloseEvent) => { stopSession(); },
-      });
+      }, systemInstruction);
       await sessionPromiseRef.current;
 
     } catch (error) {
       console.error('Failed to start session:', error);
       alert('Could not get microphone access. Please allow microphone permissions and try again.');
     }
-  }, [handleMessage]);
-
-  const stopSession = useCallback(() => {
-    sessionPromiseRef.current?.then(session => session.close());
-    sessionPromiseRef.current = null;
-    
-    mediaStreamRef.current?.getTracks().forEach(track => track.stop());
-    mediaStreamRef.current = null;
-    
-    scriptProcessorRef.current?.disconnect();
-    scriptProcessorRef.current = null;
-    mediaStreamSourceRef.current?.disconnect();
-    mediaStreamSourceRef.current = null;
-    
-    inputAudioContextRef.current?.close();
-    inputAudioContextRef.current = null;
-    outputAudioContextRef.current?.close();
-    outputAudioContextRef.current = null;
-
-    for (const source of audioSourcesRef.current.values()) {
-        source.stop();
-    }
-    audioSourcesRef.current.clear();
-    
-    setIsSessionActive(false);
-  }, []);
+  }, [handleMessage, stopSession, settings]);
   
   useEffect(() => {
       return () => {
@@ -167,9 +219,8 @@ export const useTutor = (addFeedback: (item: FeedbackItem) => void) => {
               stopSession();
           }
       }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isSessionActive]);
+  }, [isSessionActive, stopSession]);
 
 
-  return { isSessionActive, isProcessing, conversation, latestFeedback, startSession, stopSession };
+  return { isSessionActive, isProcessing, conversation, latestFeedback, combo, startSession, stopSession };
 };
